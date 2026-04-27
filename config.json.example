@@ -1,0 +1,50 @@
+{
+  "telegram": {
+    "token": "YOUR_TELEGRAM_BOT_TOKEN",
+    "allowedChatIds": [],
+    "proxy": "http://127.0.0.1:7890"
+  },
+  "cookie115": "UID=xxx; CID=xxx; SEID=xxx",
+  "tmdb": {
+    "apiKey": "YOUR_TMDB_API_KEY",
+    "language": "zh-CN"
+  },
+  "webhook": {
+    "url": "http://your-yiyi-host/api/webhook/YOUR_WEBHOOK_TOKEN",
+    "mountPath": "/mnt/115",
+    "pathField": "destination_file"
+  },
+  "rootCid": "YOUR_115_ROOT_FOLDER_CID",
+  "categoryRules": {
+    "movie": {
+      "华语电影": {
+        "original_language": "zh,cn,bo,za"
+      },
+      "动画电影": {
+        "genre_ids": "16"
+      },
+      "纪录片": {
+        "genre_ids": "99"
+      },
+      "外语电影": {}
+    },
+    "tv": {
+      "国产剧": {
+        "origin_country": "CN,TW,HK"
+      },
+      "日韩剧": {
+        "origin_country": "JP,KR"
+      },
+      "纪录片": {
+        "genre_ids": "99"
+      },
+      "综艺": {
+        "genre_ids": "10764,10767"
+      },
+      "动漫": {
+        "genre_ids": "16"
+      },
+      "欧美剧": {}
+    }
+  }
+}

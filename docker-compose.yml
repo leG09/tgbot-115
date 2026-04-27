@@ -1,0 +1,7 @@
+services:
+  tgbot-115:
+    build: .
+    container_name: tgbot-115
+    restart: unless-stopped
+    volumes:
+      - ./config.json:/app/config.json:ro
