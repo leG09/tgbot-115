@@ -10,9 +10,8 @@
     "language": "zh-CN"
   },
   "webhook": {
-    "url": "http://your-yiyi-host/api/webhook/YOUR_WEBHOOK_TOKEN",
-    "mountPath": "/mnt/115",
-    "pathField": "destination_file"
+    "url": "http://your-yiyi-host/api/webhook/YOUR_WEBHOOK_TOKEN?providerCode=gdrive-1",
+    "replacePath": "/gd*/"
   },
   "rootCid": "YOUR_115_ROOT_FOLDER_CID",
   "categoryRules": {

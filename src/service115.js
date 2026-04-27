@@ -38,12 +38,12 @@ class Service115 {
     }
 
     // 获取文件夹列表，返回子目录列表和当前路径面包屑
-    async getFolderList(cookie, cid = "0") {
+    async getFolderList(cookie, cid = "0", limit = 100) {
         try {
             const res = await axios.get("https://webapi.115.com/files", {
                 headers: this._getHeaders(cookie),
                 httpsAgent: this.agent,
-                params: { aid: 1, cid: cid, o: "user_ptime", asc: 0, offset: 0, show_dir: 1, limit: 100, type: 0, format: "json" }
+                params: { aid: 1, cid: cid, o: "user_ptime", asc: 0, offset: 0, show_dir: 1, limit, type: 0, format: "json" }
             });
             if (res.data.state) {
                 return {
@@ -56,6 +56,52 @@ class Service115 {
         } catch (e) {
             throw new Error(e.message);
         }
+    }
+
+    async getAllFolders(cookie, cid = "0", pageSize = 1000) {
+        const all = [];
+        let offset = 0;
+        let path = [];
+
+        while (true) {
+            const res = await axios.get("https://webapi.115.com/files", {
+                headers: this._getHeaders(cookie),
+                httpsAgent: this.agent,
+                params: {
+                    aid: 1,
+                    cid,
+                    o: "user_ptime",
+                    asc: 0,
+                    offset,
+                    show_dir: 1,
+                    limit: pageSize,
+                    type: 0,
+                    format: "json"
+                }
+            });
+
+            if (!res.data.state) {
+                throw new Error(res.data.error || "获取目录失败");
+            }
+
+            path = res.data.path || path;
+            const page = (res.data.data || [])
+                .filter(item => item.cid)
+                .map(i => ({ cid: String(i.cid), name: i.n }));
+            all.push(...page);
+
+            const count = Number(res.data.count || 0);
+            offset += page.length;
+            if (page.length === 0 || offset >= count) {
+                break;
+            }
+        }
+
+        return {
+            success: true,
+            path,
+            list: all
+        };
     }
 
     async addFolder(cookie, parentCid, folderName) {

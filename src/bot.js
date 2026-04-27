@@ -65,6 +65,43 @@ function createBot(config) {
             && shareItems[0]?.isFolder;
     }
 
+    function sleep(ms) {
+        return new Promise(resolve => setTimeout(resolve, ms));
+    }
+
+    async function waitForSavedFolder(parentCid, beforeCids, expectedNames) {
+        const uniqueNames = [...new Set(expectedNames.filter(Boolean))];
+        for (let attempt = 0; attempt < 8; attempt++) {
+            const { list } = await service115.getAllFolders(cookie, parentCid, 1000);
+            console.log('[save] waitForSavedFolder', JSON.stringify({
+                attempt: attempt + 1,
+                parentCid,
+                folderCount: list.length,
+                expectedNames: uniqueNames
+            }));
+            const newFolder = list.find(folder => !beforeCids.has(String(folder.cid)));
+            if (newFolder) {
+                console.log('[save] new folder detected by cid diff', JSON.stringify(newFolder));
+                return newFolder;
+            }
+
+            const matchedByName = list.filter(folder => uniqueNames.includes(folder.name));
+            if (matchedByName.length === 1) {
+                console.log('[save] new folder detected by unique name', JSON.stringify(matchedByName[0]));
+                return matchedByName[0];
+            }
+
+            if (attempt < 7) {
+                await sleep(1000);
+            }
+        }
+        console.log('[save] waitForSavedFolder timeout', JSON.stringify({
+            parentCid,
+            expectedNames: uniqueNames
+        }));
+        return null;
+    }
+
     // ──────────────────────────────────────────
     // 显示「确认转存」摘要（含自动/手动目录信息）
     // ──────────────────────────────────────────
@@ -225,6 +262,17 @@ function createBot(config) {
         const { tmdbInfo, shareCode, receiveCode, fileIds, shareItems, categoryName, manualCid, manualPath } = session;
         const folderName = buildFolderName(tmdbInfo);
         const singleFolderShare = isSingleFolderShare(shareItems);
+        console.log('[save] start', JSON.stringify({
+            shareCode,
+            receiveCode: receiveCode ? '***' : '',
+            fileIds,
+            shareItems,
+            folderName,
+            categoryName,
+            manualCid,
+            manualPath,
+            singleFolderShare
+        }));
 
         await safeEdit(session.chatId, session.botMessageId,
             `⏳ 正在转存...\n📁 <code>${escapeHtml(folderName)}</code>`);
@@ -264,6 +312,10 @@ function createBot(config) {
             parentCid = rootCid;
             parentDisplayPath = '';
         }
+        console.log('[save] target parent resolved', JSON.stringify({
+            parentCid,
+            parentDisplayPath
+        }));
 
         let finalFolderName = folderName;
         let saveCount = 0;
@@ -271,7 +323,7 @@ function createBot(config) {
         if (singleFolderShare) {
             let foldersBeforeSave;
             try {
-                const { list } = await service115.getFolderList(cookie, parentCid);
+                const { list } = await service115.getAllFolders(cookie, parentCid, 1000);
                 foldersBeforeSave = list;
             } catch (e) {
                 await safeEdit(session.chatId, session.botMessageId,
@@ -279,6 +331,10 @@ function createBot(config) {
                 sessions.delete(session.userId);
                 return;
             }
+            console.log('[save] parent folders before save', JSON.stringify({
+                parentCid,
+                folderCount: foldersBeforeSave.length
+            }));
 
             if (foldersBeforeSave.some(folder => folder.name === folderName)) {
                 await safeEdit(session.chatId, session.botMessageId,
@@ -289,6 +345,11 @@ function createBot(config) {
 
             const beforeCids = new Set(foldersBeforeSave.map(folder => String(folder.cid)));
             const sourceFolderName = shareItems[0].name || session.shareTitle || folderName;
+            console.log('[save] single folder source', JSON.stringify({
+                sourceFolderName,
+                targetFolderName: folderName,
+                parentCid
+            }));
             const saveResult = await service115.saveFiles(
                 cookie, parentCid, shareCode, receiveCode, fileIds);
 
@@ -299,18 +360,25 @@ function createBot(config) {
                 return;
             }
             saveCount = saveResult.count;
+            console.log('[save] share receive success', JSON.stringify({
+                parentCid,
+                saveCount
+            }));
 
             let savedFolder;
             try {
-                const { list } = await service115.getFolderList(cookie, parentCid);
-                savedFolder = list.find(folder => !beforeCids.has(String(folder.cid)))
-                    || list.find(folder => folder.name === sourceFolderName && !beforeCids.has(String(folder.cid)));
+                savedFolder = await waitForSavedFolder(
+                    parentCid,
+                    beforeCids,
+                    [sourceFolderName, folderName]
+                );
             } catch (e) {
                 await safeEdit(session.chatId, session.botMessageId,
                     `⚠️ 转存已完成，但无法识别新目录: ${escapeHtml(e.message)}`);
                 sessions.delete(session.userId);
                 return;
             }
+            console.log('[save] resolved saved folder', JSON.stringify(savedFolder));
 
             if (!savedFolder) {
                 await safeEdit(session.chatId, session.botMessageId,
@@ -321,9 +389,25 @@ function createBot(config) {
 
             if (savedFolder.name !== folderName) {
                 try {
+                    console.log('[save] rename start', JSON.stringify({
+                        cid: savedFolder.cid,
+                        from: savedFolder.name,
+                        to: folderName
+                    }));
                     await service115.renameFile(cookie, savedFolder.cid, folderName);
+                    console.log('[save] rename success', JSON.stringify({
+                        cid: savedFolder.cid,
+                        from: savedFolder.name,
+                        to: folderName
+                    }));
                 } catch (e) {
                     finalFolderName = savedFolder.name;
+                    console.log('[save] rename failed', JSON.stringify({
+                        cid: savedFolder.cid,
+                        from: savedFolder.name,
+                        to: folderName,
+                        error: e.message
+                    }));
                     const partialPath = parentDisplayPath
                         ? `${parentDisplayPath}/${finalFolderName}`
                         : finalFolderName;
@@ -342,6 +426,7 @@ function createBot(config) {
             let mediaFolder;
             try {
                 mediaFolder = await service115.addFolder(cookie, parentCid, folderName);
+                console.log('[save] created wrapper folder', JSON.stringify(mediaFolder));
             } catch (e) {
                 await safeEdit(session.chatId, session.botMessageId,
                     `❌ 创建目录失败: ${e.message}`);
@@ -358,10 +443,18 @@ function createBot(config) {
                 return;
             }
             saveCount = saveResult.count;
+            console.log('[save] multi item save success', JSON.stringify({
+                targetCid: mediaFolder.cid,
+                saveCount
+            }));
         }
 
         const savePath = parentDisplayPath
             ? `${parentDisplayPath}/${finalFolderName}` : finalFolderName;
+        console.log('[save] completed', JSON.stringify({
+            savePath,
+            saveCount
+        }));
 
         // 调用 Webhook（未配置则跳过）
         let webhookNote = '';
@@ -385,22 +478,24 @@ function createBot(config) {
     }
 
     async function callWebhook(folderName, parentDisplayPath) {
-        const { url, mountPath } = config.webhook || {};
+        const { url, replacePath, mountPath } = config.webhook || {};
         if (!url) return;
         const parts = [parentDisplayPath, folderName].filter(Boolean);
         let fullPath = parts.join('/').replace(/\/+/g, '/');
-        // 去掉 mountPath（115挂载点），得到相对路径
-        if (mountPath) {
-            const mount = mountPath.replace(/\/+$/, '');
-            if (fullPath.startsWith(mount + '/')) fullPath = fullPath.slice(mount.length + 1);
-            else if (fullPath === mount) fullPath = '';
-        }
         if (fullPath && !fullPath.startsWith('/')) fullPath = '/' + fullPath;
+        const payload = {
+            data: [fullPath]
+        };
+        const effectiveReplacePath = replacePath ?? mountPath;
+        if (effectiveReplacePath) {
+            payload.replace_path = effectiveReplacePath;
+        }
 
-        // POST {url}&path={fullPath}，无请求体
-        const reqUrl = url + (url.includes('?') ? '&' : '?') + 'path=' + encodeURIComponent(fullPath);
-        console.log('[webhook] POST', reqUrl);
-        const res = await axios.post(reqUrl, null, { timeout: 15000 });
+        console.log('[webhook] POST', url, JSON.stringify(payload));
+        const res = await axios.post(url, payload, {
+            timeout: 15000,
+            headers: { 'Content-Type': 'application/json' }
+        });
         const respStr = typeof res.data === 'object' ? JSON.stringify(res.data) : String(res.data);
         console.log('[webhook] response', respStr);
         return respStr;
