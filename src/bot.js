@@ -3,12 +3,17 @@ const { HttpsProxyAgent } = require('https-proxy-agent');
 const axios = require('axios');
 const service115 = require('./service115');
 const tmdbService = require('./tmdb');
+const { recognizeMedia } = require('./recognition');
 const { matchCategory } = require('./category');
 const sessions = require('./sessions');
+const { logMergeSkip } = require('./logger');
 
 const LINK_PATTERN = /https?:\/\/(?:115\.com|pan\.115\.com|115cdn\.com)\/s\/([a-z0-9]+)/i;
 const PASSWORD_PATTERN = /[?&]password=([^\s&#]+)/i;
 const PAGE_SIZE = 8;
+const MAX_SAVE_COUNT = 20;
+const MERGE_THROTTLE_MIN_MS = 100;
+const MERGE_THROTTLE_MAX_MS = 300;
 
 function createBot(config) {
     const proxyUrl = config.telegram?.proxy || process.env.HTTPS_PROXY || process.env.https_proxy;
@@ -51,7 +56,24 @@ function createBot(config) {
 
     function buildFolderName(tmdbInfo) {
         const year = tmdbInfo.year ? ` (${tmdbInfo.year})` : '';
-        return `${tmdbInfo.title}${year} [tmdbid-${tmdbInfo.tmdbId}]`;
+        if (tmdbInfo.tmdbId) {
+            return `${tmdbInfo.title}${year} [tmdbid-${tmdbInfo.tmdbId}]`;
+        }
+        return `${tmdbInfo.title}${year} [未验证]`;
+    }
+
+    function buildRecognitionLabel(tmdbInfo) {
+        if (tmdbInfo.aiGuess?.source === 'heuristic') {
+            return '启发式识别';
+        }
+        if (tmdbInfo.aiGuess?.source === 'ai') {
+            return 'AI识别';
+        }
+        return '识别结果';
+    }
+
+    function isAlreadySavedMessage(msg) {
+        return /已转存|已经转存|无需转存|已保存|已经保存/.test(String(msg || ''));
     }
 
     function buildDisplayPath(pathArr) {
@@ -67,6 +89,11 @@ function createBot(config) {
 
     function sleep(ms) {
         return new Promise(resolve => setTimeout(resolve, ms));
+    }
+
+    async function throttleMergeOp() {
+        const ms = MERGE_THROTTLE_MIN_MS + Math.floor(Math.random() * (MERGE_THROTTLE_MAX_MS - MERGE_THROTTLE_MIN_MS + 1));
+        await sleep(ms);
     }
 
     async function waitForSavedFolder(parentCid, beforeCids, expectedNames) {
@@ -102,6 +129,108 @@ function createBot(config) {
         return null;
     }
 
+    async function waitForFolderAbsent(parentCid, folderName) {
+        for (let attempt = 0; attempt < 10; attempt++) {
+            const existing = await findFolderByName(parentCid, folderName);
+            if (!existing) return true;
+            await sleep(1000);
+        }
+        return false;
+    }
+
+    function buildConflictKeyboard() {
+        return Markup.inlineKeyboard([
+            [Markup.button.callback('A. 自动合并', '115:merge:auto')],
+            [Markup.button.callback('B. 重命名合并', '115:merge:rename')],
+            [Markup.button.callback('C. 覆盖', '115:merge:overwrite')],
+            [Markup.button.callback('❌ 取消', '115:cancel')],
+        ]);
+    }
+
+    function buildOverwriteConfirmKeyboard() {
+        return Markup.inlineKeyboard([
+            [Markup.button.callback('⚠️ 确认覆盖', '115:merge_confirm:overwrite')],
+            [Markup.button.callback('返回选项', '115:merge_back')],
+            [Markup.button.callback('❌ 取消', '115:cancel')],
+        ]);
+    }
+
+    async function resolveTargetParent(session) {
+        if (session.manualCid !== undefined && session.manualCid !== null) {
+            return {
+                parentCid: session.manualCid,
+                parentDisplayPath: session.manualPath || ''
+            };
+        }
+
+        if (session.categoryName) {
+            try {
+                const res = await service115.addFolder(cookie, rootCid, session.categoryName);
+                return {
+                    parentCid: res.cid,
+                    parentDisplayPath: session.categoryName
+                };
+            } catch (e) {
+                if (!e.message.includes('已存在')) {
+                    throw e;
+                }
+                const { list } = await service115.getFolderList(cookie, rootCid);
+                const found = list.find(f => f.name === session.categoryName);
+                if (!found) {
+                    throw new Error(`找不到分类目录: ${session.categoryName}`);
+                }
+                return {
+                    parentCid: found.cid,
+                    parentDisplayPath: session.categoryName
+                };
+            }
+        }
+
+        return {
+            parentCid: rootCid,
+            parentDisplayPath: ''
+        };
+    }
+
+    async function findFolderByName(parentCid, folderName) {
+        const { list } = await service115.getAllFolders(cookie, parentCid, 1000);
+        return list.find(folder => folder.name === folderName) || null;
+    }
+
+    async function showConflictResolution(session, parentDisplayPath, folderName) {
+        const fullPath = parentDisplayPath ? `${parentDisplayPath}/${folderName}` : folderName;
+        session.step = 'conflict';
+        sessions.set(session.userId, session);
+        await safeEdit(session.chatId, session.botMessageId, [
+            `⚠️ 目标目录已存在`,
+            `📂 <code>${escapeHtml(fullPath)}</code>`,
+            '',
+            `请选择处理方式：`,
+            `A. 自动合并：并入已有目录，重名文件跳过`,
+            `B. 重命名合并：旧目录临时改名，新目录导入后再合并`,
+            `C. 覆盖：删除已有目录后重新转存`,
+        ].join('\n'), buildConflictKeyboard());
+    }
+
+    async function ensureConflictStrategy(session, parentCid, parentDisplayPath, folderName) {
+        const existingFolder = await findFolderByName(parentCid, folderName);
+        if (!existingFolder) return { existingFolder: null, shouldPause: false };
+
+        if (!session.mergeMode) {
+            session.pendingConflict = {
+                parentCid,
+                parentDisplayPath,
+                folderName,
+                existingCid: existingFolder.cid
+            };
+            sessions.set(session.userId, session);
+            await showConflictResolution(session, parentDisplayPath, folderName);
+            return { existingFolder, shouldPause: true };
+        }
+
+        return { existingFolder, shouldPause: false };
+    }
+
     // ──────────────────────────────────────────
     // 显示「确认转存」摘要（含自动/手动目录信息）
     // ──────────────────────────────────────────
@@ -112,6 +241,9 @@ function createBot(config) {
         const typeStr = tmdbInfo.isTV ? '📺 剧集' : '🎬 电影';
         const year = tmdbInfo.year ? ` (${tmdbInfo.year})` : '';
         const rating = tmdbInfo.rating && tmdbInfo.rating !== 'NaN' ? ` ⭐${tmdbInfo.rating}` : '';
+        const verificationTag = tmdbInfo.verified === false
+            ? ' ⚠️未验证'
+            : (tmdbInfo.verificationStatus === 'tmdb_override' ? ' ⚠️TMDB已纠偏' : ' ✅已验证');
         const overview = tmdbInfo.overview
             ? `\n<i>${escapeHtml(tmdbInfo.overview.substring(0, 150))}${tmdbInfo.overview.length > 150 ? '…' : ''}</i>`
             : '';
@@ -131,11 +263,13 @@ function createBot(config) {
             : `${categoryName ? categoryName + '/' : ''}${folderName}`;
 
         const msg = [
-            `${typeStr} <b>${escapeHtml(tmdbInfo.title)}${year}</b>${rating}${overview}`,
+            `${typeStr} <b>${escapeHtml(tmdbInfo.title)}${year}</b>${rating}${verificationTag}${overview}`,
             '',
             dirLine,
             `📂 <code>${escapeHtml(savePath)}</code>`,
-            `🆔 tmdbid-${tmdbInfo.tmdbId}`,
+            tmdbInfo.tmdbId
+                ? `🆔 tmdbid-${tmdbInfo.tmdbId}`
+                : `🧠 ${buildRecognitionLabel(tmdbInfo)}: <code>${escapeHtml(tmdbInfo.aiGuess?.title || tmdbInfo.title)}</code>`,
         ].join('\n');
 
         const keyboard = Markup.inlineKeyboard([
@@ -230,23 +364,19 @@ function createBot(config) {
     // ──────────────────────────────────────────
     async function searchAndClassify(session) {
         await safeEdit(session.chatId, session.botMessageId,
-            `🔍 正在搜索影视信息...\n<code>${escapeHtml(session.shareTitle)}</code>`);
+            `🧠 正在识别影视信息...\n<code>${escapeHtml(session.shareTitle)}</code>`);
 
         try {
-            const tmdbInfo = await tmdbService.searchTmdb(
-                session.shareTitle, config.tmdb.apiKey, config.tmdb.language);
-
-            if (!tmdbInfo) {
-                await showTypeSelection(session,
-                    `🔍 未找到匹配影视信息\n搜索词: <code>${escapeHtml(session.shareTitle)}</code>`);
-                return;
-            }
-
+            const recognition = await recognizeMedia(session.shareTitle, config);
+            const tmdbInfo = recognition.finalInfo;
             session.tmdbInfo = tmdbInfo;
-            session.categoryName = matchCategory(tmdbInfo, categoryRules) || null;
+            session.aiRecognition = recognition.aiResult;
+            session.categoryName = tmdbInfo.verified ? (matchCategory(tmdbInfo, categoryRules) || null) : null;
             // 清除手动目录选择
             session.manualCid = undefined;
             session.manualPath = undefined;
+            session.mergeMode = null;
+            session.pendingConflict = null;
             sessions.set(session.userId, session);
 
             await showAutoConfirm(session);
@@ -258,7 +388,241 @@ function createBot(config) {
     // ──────────────────────────────────────────
     // 执行转存 + Webhook
     // ──────────────────────────────────────────
+    async function mergeFolderContents(sourceFolderCid, targetFolderCid, skipped, pathPrefix = '') {
+        const [sourceRes, targetRes] = await Promise.all([
+            service115.getFolderEntries(cookie, sourceFolderCid),
+            service115.getFolderEntries(cookie, targetFolderCid)
+        ]);
+        const targetByName = new Map(targetRes.list.map(item => [item.name, item]));
+
+        for (const sourceItem of sourceRes.list) {
+            const currentPath = pathPrefix ? `${pathPrefix}/${sourceItem.name}` : sourceItem.name;
+            const targetItem = targetByName.get(sourceItem.name);
+
+            if (!targetItem) {
+                await throttleMergeOp();
+                await service115.moveItems(cookie, sourceItem.id, targetFolderCid);
+                continue;
+            }
+
+            if (sourceItem.isFolder && targetItem.isFolder) {
+                await mergeFolderContents(sourceItem.cid, targetItem.cid, skipped, currentPath);
+                await throttleMergeOp();
+                await service115.deleteItems(cookie, sourceItem.id).catch(() => {});
+                continue;
+            }
+
+            skipped.push(currentPath);
+            logMergeSkip({
+                sourceFolderCid,
+                targetFolderCid,
+                skippedPath: currentPath
+            });
+            await throttleMergeOp();
+            await service115.deleteItems(cookie, sourceItem.id).catch(() => {});
+        }
+    }
+
+    async function saveShareIntoNewFolder(parentCid, folderName, singleFolderShare, shareItems, shareCode, receiveCode, fileIds) {
+        let finalFolderName = folderName;
+        let saveCount = 0;
+
+        if (singleFolderShare) {
+            const foldersBeforeSave = await service115.getAllFolders(cookie, parentCid, 1000);
+            const beforeCids = new Set(foldersBeforeSave.list.map(folder => String(folder.cid)));
+            const sourceFolderName = shareItems[0].name || folderName;
+            const saveResult = await service115.saveFiles(cookie, parentCid, shareCode, receiveCode, fileIds);
+            if (!saveResult.success) {
+                if (isAlreadySavedMessage(saveResult.msg)) {
+                    return {
+                        alreadySaved: true,
+                        folderCid: null,
+                        folderName: finalFolderName,
+                        saveCount: 0,
+                        message: saveResult.msg
+                    };
+                }
+                throw new Error(`转存失败: ${saveResult.msg}`);
+            }
+            saveCount = saveResult.count;
+
+            const savedFolder = await waitForSavedFolder(parentCid, beforeCids, [sourceFolderName, folderName]);
+            if (!savedFolder) {
+                throw new Error('转存已完成，但无法定位新目录');
+            }
+
+            if (savedFolder.name !== folderName) {
+                await service115.renameFile(cookie, savedFolder.cid, folderName);
+            }
+
+            return {
+                folderCid: savedFolder.cid,
+                folderName: finalFolderName,
+                saveCount
+            };
+        }
+
+        const tempFolder = await service115.addFolder(cookie, parentCid, folderName);
+        const saveResult = await service115.saveFiles(cookie, tempFolder.cid, shareCode, receiveCode, fileIds);
+        if (!saveResult.success) {
+            if (isAlreadySavedMessage(saveResult.msg)) {
+                await service115.deleteItems(cookie, tempFolder.cid).catch(() => {});
+                return {
+                    alreadySaved: true,
+                    folderCid: null,
+                    folderName,
+                    saveCount: 0,
+                    message: saveResult.msg
+                };
+            }
+            throw new Error(`转存失败: ${saveResult.msg}`);
+        }
+        saveCount = saveResult.count;
+
+        return {
+            folderCid: tempFolder.cid,
+            folderName,
+            saveCount
+        };
+    }
+
+    async function createUniqueTempName(parentCid, baseName) {
+        const existing = await service115.getAllFolders(cookie, parentCid, 1000);
+        const names = new Set(existing.list.map(folder => folder.name));
+        for (let attempt = 0; attempt < 20; attempt++) {
+            const suffix = attempt === 0
+                ? `.__merge__${Date.now()}`
+                : `.__merge__${Date.now()}_${attempt}`;
+            const tempName = `${baseName}${suffix}`;
+            if (!names.has(tempName)) {
+                return tempName;
+            }
+        }
+        throw new Error('生成临时目录名称失败');
+    }
+
+    async function createUniqueTempFolder(parentCid, baseName) {
+        let attempt = 0;
+        while (attempt < 5) {
+            const tempName = await createUniqueTempName(parentCid, baseName);
+            try {
+                return await service115.addFolder(cookie, parentCid, tempName);
+            } catch (e) {
+                attempt += 1;
+                if (attempt >= 5) throw e;
+            }
+        }
+        throw new Error('创建临时目录失败');
+    }
+
+    async function handleExistingFolder(session, existingFolder, parentCid, folderName, singleFolderShare) {
+        const skipped = [];
+
+        if (session.mergeMode === 'overwrite') {
+            await service115.deleteItems(cookie, existingFolder.cid);
+            const deleted = await waitForFolderAbsent(parentCid, folderName);
+            if (!deleted) {
+                throw new Error('已有目录删除超时，请稍后重试');
+            }
+            return {
+                ...await saveShareIntoNewFolder(parentCid, folderName, singleFolderShare, session.shareItems, session.shareCode, session.receiveCode, session.fileIds),
+                skipped
+            };
+        }
+
+        if (session.mergeMode === 'rename') {
+            const tempExistingName = `${folderName}.__old__${Date.now()}`;
+            await service115.renameFile(cookie, existingFolder.cid, tempExistingName);
+            try {
+                const imported = await saveShareIntoNewFolder(parentCid, folderName, singleFolderShare, session.shareItems, session.shareCode, session.receiveCode, session.fileIds);
+                if (imported.alreadySaved) {
+                    await service115.renameFile(cookie, existingFolder.cid, folderName).catch(() => {});
+                    return {
+                        folderCid: existingFolder.cid,
+                        folderName,
+                        saveCount: 0,
+                        skipped,
+                        noNewContent: true,
+                        message: imported.message || '分享内容已转存过，无新增内容可合并'
+                    };
+                }
+                // B模式固定采用“小目录并入大目录”：将新导入目录并入旧目录，再恢复旧目录原名
+                await mergeFolderContents(imported.folderCid, existingFolder.cid, skipped);
+                await throttleMergeOp();
+                await service115.deleteItems(cookie, imported.folderCid).catch(() => {});
+                await service115.renameFile(cookie, existingFolder.cid, folderName);
+
+                return {
+                    folderCid: existingFolder.cid,
+                    folderName,
+                    saveCount: imported.saveCount,
+                    skipped
+                };
+            } catch (e) {
+                await service115.renameFile(cookie, existingFolder.cid, folderName).catch(() => {});
+                throw e;
+            }
+        }
+
+        const tempFolderName = await createUniqueTempName(parentCid, folderName);
+        const imported = singleFolderShare
+            ? await saveShareIntoNewFolder(parentCid, tempFolderName, true, session.shareItems, session.shareCode, session.receiveCode, session.fileIds)
+            : await (async () => {
+                const tempFolder = await service115.addFolder(cookie, parentCid, tempFolderName);
+                const saveResult = await service115.saveFiles(cookie, tempFolder.cid, session.shareCode, session.receiveCode, session.fileIds);
+                if (!saveResult.success) {
+                    if (isAlreadySavedMessage(saveResult.msg)) {
+                        await service115.deleteItems(cookie, tempFolder.cid).catch(() => {});
+                        return {
+                            alreadySaved: true,
+                            folderCid: null,
+                            folderName: tempFolder.name,
+                            saveCount: 0,
+                            message: saveResult.msg
+                        };
+                    }
+                    throw new Error(`转存失败: ${saveResult.msg}`);
+                }
+                return {
+                    folderCid: tempFolder.cid,
+                    folderName: tempFolder.name,
+                    saveCount: saveResult.count
+                };
+            })();
+
+        if (imported.alreadySaved) {
+            return {
+                folderCid: existingFolder.cid,
+                folderName,
+                saveCount: 0,
+                skipped,
+                noNewContent: true,
+                message: imported.message || '分享内容已转存过，无新增内容可合并'
+            };
+        }
+
+        await mergeFolderContents(imported.folderCid, existingFolder.cid, skipped);
+        await service115.deleteItems(cookie, imported.folderCid).catch(() => {});
+
+        return {
+            folderCid: existingFolder.cid,
+            folderName,
+            saveCount: imported.saveCount,
+            skipped
+        };
+    }
+
     async function doSaveAndWebhook(session) {
+        if (session.saveInProgress) {
+            console.log('[save] duplicate request ignored', JSON.stringify({
+                userId: session.userId,
+                shareCode: session.shareCode
+            }));
+            return;
+        }
+        session.saveInProgress = true;
+        sessions.set(session.userId, session);
+
         const { tmdbInfo, shareCode, receiveCode, fileIds, shareItems, categoryName, manualCid, manualPath } = session;
         const folderName = buildFolderName(tmdbInfo);
         const singleFolderShare = isSingleFolderShare(shareItems);
@@ -277,40 +641,15 @@ function createBot(config) {
         await safeEdit(session.chatId, session.botMessageId,
             `⏳ 正在转存...\n📁 <code>${escapeHtml(folderName)}</code>`);
 
-        // 确定父目录 CID
         let parentCid, parentDisplayPath;
-        if (manualCid !== undefined && manualCid !== null) {
-            // 用户手动选择了目录
-            parentCid = manualCid;
-            parentDisplayPath = manualPath || '';
-        } else if (categoryName) {
-            // 自动分类：创建分类目录，已存在则查找其 CID
-            try {
-                const res = await service115.addFolder(cookie, rootCid, categoryName);
-                parentCid = res.cid;
-            } catch (e) {
-                if (e.message.includes('已存在')) {
-                    const { list } = await service115.getFolderList(cookie, rootCid);
-                    const found = list.find(f => f.name === categoryName);
-                    if (!found) {
-                        await safeEdit(session.chatId, session.botMessageId,
-                            `❌ 找不到分类目录: ${categoryName}`);
-                        sessions.delete(session.userId);
-                        return;
-                    }
-                    parentCid = found.cid;
-                } else {
-                    await safeEdit(session.chatId, session.botMessageId,
-                        `❌ 创建分类目录失败: ${e.message}`);
-                    sessions.delete(session.userId);
-                    return;
-                }
-            }
-            parentDisplayPath = categoryName;
-        } else {
-            // 未匹配分类，保存到 rootCid
-            parentCid = rootCid;
-            parentDisplayPath = '';
+        try {
+            ({ parentCid, parentDisplayPath } = await resolveTargetParent(session));
+        } catch (e) {
+            session.saveInProgress = false;
+            await safeEdit(session.chatId, session.botMessageId,
+                `❌ 目标目录准备失败: ${escapeHtml(e.message)}`);
+            sessions.delete(session.userId);
+            return;
         }
         console.log('[save] target parent resolved', JSON.stringify({
             parentCid,
@@ -319,134 +658,51 @@ function createBot(config) {
 
         let finalFolderName = folderName;
         let saveCount = 0;
-
-        if (singleFolderShare) {
-            let foldersBeforeSave;
-            try {
-                const { list } = await service115.getAllFolders(cookie, parentCid, 1000);
-                foldersBeforeSave = list;
-            } catch (e) {
-                await safeEdit(session.chatId, session.botMessageId,
-                    `❌ 获取目标目录失败: ${e.message}`);
-                sessions.delete(session.userId);
-                return;
-            }
-            console.log('[save] parent folders before save', JSON.stringify({
-                parentCid,
-                folderCount: foldersBeforeSave.length
-            }));
-
-            if (foldersBeforeSave.some(folder => folder.name === folderName)) {
-                await safeEdit(session.chatId, session.botMessageId,
-                    `❌ 目录已存在: <code>${escapeHtml(folderName)}</code>`);
-                sessions.delete(session.userId);
+        let skipped = [];
+        let noNewContent = false;
+        let noNewContentMessage = '';
+        try {
+            const conflict = await ensureConflictStrategy(session, parentCid, parentDisplayPath, folderName);
+            if (conflict.shouldPause) {
+                session.saveInProgress = false;
+                sessions.set(session.userId, session);
                 return;
             }
 
-            const beforeCids = new Set(foldersBeforeSave.map(folder => String(folder.cid)));
-            const sourceFolderName = shareItems[0].name || session.shareTitle || folderName;
-            console.log('[save] single folder source', JSON.stringify({
-                sourceFolderName,
-                targetFolderName: folderName,
-                parentCid
-            }));
-            const saveResult = await service115.saveFiles(
-                cookie, parentCid, shareCode, receiveCode, fileIds);
-
-            if (!saveResult.success) {
-                await safeEdit(session.chatId, session.botMessageId,
-                    `❌ 转存失败: ${saveResult.msg}`);
-                sessions.delete(session.userId);
-                return;
-            }
-            saveCount = saveResult.count;
-            console.log('[save] share receive success', JSON.stringify({
-                parentCid,
-                saveCount
-            }));
-
-            let savedFolder;
-            try {
-                savedFolder = await waitForSavedFolder(
-                    parentCid,
-                    beforeCids,
-                    [sourceFolderName, folderName]
-                );
-            } catch (e) {
-                await safeEdit(session.chatId, session.botMessageId,
-                    `⚠️ 转存已完成，但无法识别新目录: ${escapeHtml(e.message)}`);
-                sessions.delete(session.userId);
-                return;
-            }
-            console.log('[save] resolved saved folder', JSON.stringify(savedFolder));
-
-            if (!savedFolder) {
-                await safeEdit(session.chatId, session.botMessageId,
-                    `⚠️ 转存已完成，但无法定位新目录，未执行重命名。`);
+            const needsMergeCountLimit = conflict.existingFolder
+                && (session.mergeMode === 'auto' || session.mergeMode === 'rename');
+            if (needsMergeCountLimit && session.shareCount > MAX_SAVE_COUNT) {
+                session.saveInProgress = false;
+                await safeEdit(session.chatId, session.botMessageId, [
+                    `❌ 该分享包含 <b>${session.shareCount}</b> 个文件，超过限制`,
+                    `仅目录合并限制不超过 <b>${MAX_SAVE_COUNT}</b> 个文件；如需直接替换原目录，请选择 <b>覆盖</b>。`
+                ].join('\n'));
                 sessions.delete(session.userId);
                 return;
             }
 
-            if (savedFolder.name !== folderName) {
-                try {
-                    console.log('[save] rename start', JSON.stringify({
-                        cid: savedFolder.cid,
-                        from: savedFolder.name,
-                        to: folderName
-                    }));
-                    await service115.renameFile(cookie, savedFolder.cid, folderName);
-                    console.log('[save] rename success', JSON.stringify({
-                        cid: savedFolder.cid,
-                        from: savedFolder.name,
-                        to: folderName
-                    }));
-                } catch (e) {
-                    finalFolderName = savedFolder.name;
-                    console.log('[save] rename failed', JSON.stringify({
-                        cid: savedFolder.cid,
-                        from: savedFolder.name,
-                        to: folderName,
-                        error: e.message
-                    }));
-                    const partialPath = parentDisplayPath
-                        ? `${parentDisplayPath}/${finalFolderName}`
-                        : finalFolderName;
-                    await safeEdit(session.chatId, session.botMessageId, [
-                        `⚠️ 转存已完成，但重命名失败`,
-                        `📂 <code>${escapeHtml(partialPath)}</code>`,
-                        `📝 目标名称: <code>${escapeHtml(folderName)}</code>`,
-                        `原因: ${escapeHtml(e.message)}`,
-                    ].join('\n'));
-                    sessions.delete(session.userId);
-                    return;
+            if (conflict.existingFolder) {
+                const result = await handleExistingFolder(session, conflict.existingFolder, parentCid, folderName, singleFolderShare);
+                finalFolderName = result.folderName;
+                saveCount = result.saveCount;
+                skipped = result.skipped || [];
+                noNewContent = Boolean(result.noNewContent);
+                noNewContentMessage = result.message || '';
+            } else {
+                const result = await saveShareIntoNewFolder(parentCid, folderName, singleFolderShare, shareItems, shareCode, receiveCode, fileIds);
+                if (result.alreadySaved) {
+                    noNewContent = true;
+                    noNewContentMessage = result.message || '';
                 }
+                finalFolderName = result.folderName;
+                saveCount = result.saveCount;
             }
-        } else {
-            // 多文件/多目录分享仍沿用外层媒体目录，避免内容散落到父目录
-            let mediaFolder;
-            try {
-                mediaFolder = await service115.addFolder(cookie, parentCid, folderName);
-                console.log('[save] created wrapper folder', JSON.stringify(mediaFolder));
-            } catch (e) {
-                await safeEdit(session.chatId, session.botMessageId,
-                    `❌ 创建目录失败: ${e.message}`);
-                sessions.delete(session.userId);
-                return;
-            }
-
-            const saveResult = await service115.saveFiles(
-                cookie, mediaFolder.cid, shareCode, receiveCode, fileIds);
-            if (!saveResult.success) {
-                await safeEdit(session.chatId, session.botMessageId,
-                    `❌ 转存失败: ${saveResult.msg}`);
-                sessions.delete(session.userId);
-                return;
-            }
-            saveCount = saveResult.count;
-            console.log('[save] multi item save success', JSON.stringify({
-                targetCid: mediaFolder.cid,
-                saveCount
-            }));
+        } catch (e) {
+            session.saveInProgress = false;
+            await safeEdit(session.chatId, session.botMessageId,
+                `❌ 转存失败: ${escapeHtml(e.message)}`);
+            sessions.delete(session.userId);
+            return;
         }
 
         const savePath = parentDisplayPath
@@ -468,12 +724,18 @@ function createBot(config) {
         }
 
         await safeEdit(session.chatId, session.botMessageId, [
-            `✅ <b>转存成功！</b>`,
+            noNewContent ? `✅ <b>无需重复转存</b>` : `✅ <b>转存成功！</b>`,
             `📂 <code>${escapeHtml(savePath)}</code>`,
             `📊 文件数量: ${saveCount}`,
+            noNewContentMessage ? `ℹ️ ${escapeHtml(noNewContentMessage)}` : '',
+            skipped.length ? `⏭️ 跳过重名项: ${skipped.length}` : '',
+            tmdbInfo.verified === false ? `⚠️ 当前结果为 AI 识别，TMDB 未验证` : '',
             webhookNote,
         ].join('\n'));
 
+        session.mergeMode = null;
+        session.pendingConflict = null;
+        session.saveInProgress = false;
         sessions.delete(session.userId);
     }
 
@@ -510,6 +772,7 @@ function createBot(config) {
             session.fileIds = info.fileIds;
             session.shareItems = info.items;
             session.shareTitle = info.shareTitle;
+            session.shareCount = Number(info.count || 0);
             sessions.set(session.userId, session);
 
             await safeEdit(session.chatId, session.botMessageId,
@@ -558,9 +821,11 @@ function createBot(config) {
                 botMessageId: sent.message_id,
                 shareCode, receiveCode,
                 fileIds: [], shareTitle: '',
+                shareCount: 0,
                 currentCid: rootCid, currentPath: [], currentFolders: [], currentPage: 0,
                 categoryName: null, manualCid: undefined, manualPath: undefined,
                 tmdbInfo: null, mediaType: null,
+                aiRecognition: null, mergeMode: null, pendingConflict: null, saveInProgress: false,
                 step: 'loading',
             };
             sessions.set(userId, session);
@@ -598,10 +863,17 @@ function createBot(config) {
                     try { info = await tmdbService.getTmdbById(tmdbId, 'movie', config.tmdb.apiKey, config.tmdb.language); }
                     catch { info = await tmdbService.getTmdbById(tmdbId, 'tv', config.tmdb.apiKey, config.tmdb.language); }
                 }
-                session.tmdbInfo = info;
+                session.tmdbInfo = {
+                    ...info,
+                    verified: true,
+                    verificationStatus: 'manual_tmdb',
+                    recognitionSource: 'manual_tmdb'
+                };
                 session.categoryName = matchCategory(info, categoryRules) || null;
                 session.manualCid = undefined;
                 session.manualPath = undefined;
+                session.mergeMode = null;
+                session.pendingConflict = null;
                 sessions.set(userId, session);
                 await showAutoConfirm(session);
             } catch (e) {
@@ -636,8 +908,6 @@ function createBot(config) {
                 // ── 确认转存 ──
                 case 'confirm': {
                     if (!session.tmdbInfo) { await ctx.answerCbQuery('❌ 状态异常'); return; }
-                    session.step = 'saving';
-                    sessions.set(userId, session);
                     await doSaveAndWebhook(session);
                     break;
                 }
@@ -711,6 +981,44 @@ function createBot(config) {
                     const label = arg === 'movie' ? '🎬 电影' : '📺 剧集/动漫';
                     await safeEdit(session.chatId, session.botMessageId,
                         `${label} 请直接回复 TMDB ID（纯数字）：\n可在 https://www.themoviedb.org 搜索`);
+                    break;
+                }
+
+                case 'merge': {
+                    session.mergeMode = arg;
+                    sessions.set(userId, session);
+                    if (arg === 'overwrite') {
+                        const pending = session.pendingConflict || {};
+                        const fullPath = pending.parentDisplayPath
+                            ? `${pending.parentDisplayPath}/${pending.folderName}`
+                            : pending.folderName;
+                        await safeEdit(session.chatId, session.botMessageId, [
+                            `⚠️ 覆盖将删除已有目录后重新转存`,
+                            `📂 <code>${escapeHtml(fullPath || '')}</code>`,
+                            `此操作不可撤销，请二次确认。`
+                        ].join('\n'), buildOverwriteConfirmKeyboard());
+                        break;
+                    }
+                    await doSaveAndWebhook(session);
+                    break;
+                }
+
+                case 'merge_confirm': {
+                    session.mergeMode = arg;
+                    sessions.set(userId, session);
+                    await doSaveAndWebhook(session);
+                    break;
+                }
+
+                case 'merge_back': {
+                    const pending = session.pendingConflict;
+                    if (!pending) {
+                        await showAutoConfirm(session);
+                        break;
+                    }
+                    session.mergeMode = null;
+                    sessions.set(userId, session);
+                    await showConflictResolution(session, pending.parentDisplayPath, pending.folderName);
                     break;
                 }
 

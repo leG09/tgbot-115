@@ -9,6 +9,13 @@
     "apiKey": "YOUR_TMDB_API_KEY",
     "language": "zh-CN"
   },
+  "ai": {
+    "enabled": false,
+    "baseURL": "https://api.openai.com/v1",
+    "apiKey": "YOUR_AI_API_KEY",
+    "model": "gpt-4.1-mini",
+    "timeoutMs": 15000
+  },
   "webhook": {
     "url": "http://your-yiyi-host/api/webhook/YOUR_WEBHOOK_TOKEN?providerCode=gdrive-1",
     "replacePath": "/gd*/"
@@ -16,34 +23,42 @@
   "rootCid": "YOUR_115_ROOT_FOLDER_CID",
   "categoryRules": {
     "movie": {
-      "华语电影": {
-        "original_language": "zh,cn,bo,za"
-      },
       "动画电影": {
         "genre_ids": "16"
       },
-      "纪录片": {
-        "genre_ids": "99"
+      "华语电影": {
+        "original_language": "zh,cn,bo,za"
       },
       "外语电影": {}
     },
     "tv": {
-      "国产剧": {
+      "国漫": {
+        "genre_ids": "16",
         "origin_country": "CN,TW,HK"
       },
-      "日韩剧": {
-        "origin_country": "JP,KR"
+      "日番": {
+        "genre_ids": "16",
+        "origin_country": "JP"
       },
       "纪录片": {
         "genre_ids": "99"
       },
+      "儿童": {
+        "genre_ids": "10762"
+      },
       "综艺": {
         "genre_ids": "10764,10767"
       },
-      "动漫": {
-        "genre_ids": "16"
+      "国产剧": {
+        "origin_country": "CN,TW,HK"
       },
-      "欧美剧": {}
+      "欧美剧": {
+        "origin_country": "US,FR,GB,DE,ES,IT,NL,PT,RU,UK"
+      },
+      "日韩剧": {
+        "origin_country": "JP,KP,KR,TH,IN,SG"
+      },
+      "未分类": {}
     }
   }
 }

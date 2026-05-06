@@ -5,6 +5,7 @@
 const axios = require('axios');
 
 const TMDB_BASE = 'https://api.themoviedb.org/3';
+const TMDB_TIMEOUT = 8000;
 
 // 噪声词正则，用于清洗标题（参考 YiYi MediaScrapeWorker）
 const NOISE_PATTERNS = [
@@ -31,7 +32,17 @@ const TMDB_ID_PATTERN = /(?:tmdb(?:id)?[-_=:\s：＝]*)([0-9]{2,10})/i;
 const YEAR_PATTERN = /(?<!\d)((?:19|20)\d{2})(?!\d)/;
 // 剧集判断
 const SEASON_PATTERN = /\b[Ss]\s*(\d{1,2})\b/;
+const EPISODE_PATTERN = /\bS\d{1,2}E\d{1,3}\b|\b\d{1,2}x\d{1,3}\b|\bE\d{1,3}\b/i;
 const TV_CN_PATTERN = /第.+季|第.+话|第.+集|剧集|连续剧|电视剧/;
+const NON_FEATURE_TITLE_PATTERN = /\b(soundtrack|score|music from|behind the scenes|trailer|featurette|making of)\b|制作特辑|幕后|预告/i;
+const CN_PUNCTUATION_PATTERN = /[：:·,，!！?？()（）\[\]【】\-_.]/g;
+
+async function tmdbGet(path, params) {
+    return axios.get(`${TMDB_BASE}${path}`, {
+        params,
+        timeout: TMDB_TIMEOUT
+    });
+}
 
 /**
  * 从原始分享标题解析影视名称
@@ -47,12 +58,13 @@ function parseName(raw) {
     const yearMatch = raw.match(YEAR_PATTERN);
     const year = yearMatch ? parseInt(yearMatch[1]) : null;
 
-    const likelyTv = SEASON_PATTERN.test(raw) || TV_CN_PATTERN.test(raw);
+    const likelyTv = SEASON_PATTERN.test(raw) || EPISODE_PATTERN.test(raw) || TV_CN_PATTERN.test(raw);
 
     let title = raw;
 
     // 去除 TMDB ID
     title = title.replace(/(?:tmdb(?:id)?[-_=:\s：＝]*)[0-9]{2,10}/gi, ' ');
+    title = title.replace(/[{}]/g, ' ');
     // 去除年份
     title = title.replace(YEAR_PATTERN, ' ');
     // 去除各类噪声
@@ -102,77 +114,151 @@ function scoreResult(parsed, result, isTV) {
     const title = isTV
         ? (result.name || result.original_name || '')
         : (result.title || result.original_title || '');
+    const originalTitle = isTV
+        ? (result.original_name || result.name || '')
+        : (result.original_title || result.title || '');
     const date = isTV ? result.first_air_date : result.release_date;
     const resultYear = date ? parseInt(date.substring(0, 4)) : null;
 
-    const sim = titleSimilarity(parsed.title, title);
+    const sim = Math.max(
+        titleSimilarity(parsed.title, title),
+        titleSimilarity(parsed.title, originalTitle)
+    );
     if (sim >= 0.6) score += 100;
     else score += sim * 60;
 
     if (parsed.year && resultYear && parsed.year === resultYear) score += 30;
     if (parsed.likelyTv && isTV) score += 30;
+    if (parsed.likelyTv && !isTV) score -= 80;
     if (!parsed.likelyTv && !isTV) score += 10;
+    if (parsed.year && resultYear && Math.abs(parsed.year - resultYear) >= 2) score -= 20;
+    if (NON_FEATURE_TITLE_PATTERN.test(title) || NON_FEATURE_TITLE_PATTERN.test(originalTitle)) score -= 60;
 
     return score;
+}
+
+async function performSearch(parsed, apiKey, language, useYear = true) {
+    const commonParams = { api_key: apiKey, language, include_adult: false, page: 1 };
+
+    return Promise.allSettled([
+        tmdbGet('/search/movie', { ...commonParams, query: parsed.title, ...(useYear && parsed.year ? { year: parsed.year } : {}) }),
+        tmdbGet('/search/tv', { ...commonParams, query: parsed.title, ...(useYear && parsed.year ? { first_air_date_year: parsed.year } : {}) })
+    ]);
+}
+
+function simplifyChineseToken(token) {
+    if (!token) return '';
+    let value = token.trim();
+    value = value.replace(/^(?:最后的|最后|终极|最终|特别篇|特别版|加长版|导演剪辑版)/, '');
+    value = value.replace(/的/g, '');
+    const digitChunk = value.match(/[0-9]+(?:[天日季集部篇])?/);
+    if (digitChunk) {
+        return digitChunk[0];
+    }
+    return value;
+}
+
+function buildQueryVariants(title) {
+    const variants = new Set();
+    const base = String(title || '').trim();
+    if (!base) return [];
+
+    variants.add(base);
+
+    const normalized = base.replace(CN_PUNCTUATION_PATTERN, ' ').replace(/\s+/g, ' ').trim();
+    if (normalized) variants.add(normalized);
+
+    const parts = normalized.split(/\s+/).filter(Boolean);
+    if (parts.length >= 2) {
+        variants.add(`${parts[0]} ${parts[parts.length - 1]}`);
+        const simplifiedLast = simplifyChineseToken(parts[parts.length - 1]);
+        if (simplifiedLast) {
+            variants.add(`${parts[0]} ${simplifiedLast}`);
+        }
+    }
+
+    return [...variants];
 }
 
 /**
  * 根据分享标题搜索 TMDB
  * @returns {Promise<TmdbInfo|null>}
  */
-async function searchTmdb(shareTitle, apiKey, language = 'zh-CN') {
-    const parsed = parseName(shareTitle);
+async function searchTmdbByGuess(guess, apiKey, language = 'zh-CN') {
+    const parsed = typeof guess === 'string'
+        ? parseName(guess)
+        : {
+            title: guess?.title || '',
+            tmdbId: guess?.tmdbId || null,
+            year: guess?.year ? parseInt(guess.year) : null,
+            likelyTv: guess?.mediaType === 'tv'
+        };
     if (!parsed.title) return null;
 
-    // 如果原始标题已含 TMDB ID，直接查询，但需校验标题相似度防止 ID 错误
+    // 如果原始标题已含 TMDB ID，优先直接查询，避免搜索歧义
     if (parsed.tmdbId) {
         try {
-            const info = await getTmdbById(parsed.tmdbId, 'movie', apiKey, language)
-                .catch(() => getTmdbById(parsed.tmdbId, 'tv', apiKey, language));
+            const [movieInfo, tvInfo] = await Promise.allSettled([
+                getTmdbById(parsed.tmdbId, 'movie', apiKey, language),
+                getTmdbById(parsed.tmdbId, 'tv', apiKey, language)
+            ]);
+            const info = movieInfo.status === 'fulfilled'
+                ? movieInfo.value
+                : (tvInfo.status === 'fulfilled' ? tvInfo.value : null);
+            if (info) {
             // 相似度校验：如果匹配到的标题与解析标题差异过大，视为 ID 错误，fallback 到搜索
-            const sim = titleSimilarity(parsed.title, info.title) ||
-                        titleSimilarity(parsed.title, info.originalTitle || '');
-            if (sim >= 0.3) return info;
+                const sim = titleSimilarity(parsed.title, info.title) ||
+                            titleSimilarity(parsed.title, info.originalTitle || '');
+                if (sim >= 0.3 || !parsed.title.replace(/[\s{}[\]()]/g, '')) return info;
+            }
             // 相似度过低，忽略此 ID，继续关键词搜索
         } catch (e) { /* fallback to search */ }
     }
 
-    const commonParams = { api_key: apiKey, language, include_adult: false, page: 1 };
+    const queryVariants = buildQueryVariants(parsed.title);
 
-    const [movieRes, tvRes] = await Promise.allSettled([
-        axios.get(`${TMDB_BASE}/search/movie`, {
-            params: { ...commonParams, query: parsed.title, ...(parsed.year ? { year: parsed.year } : {}) }
-        }),
-        axios.get(`${TMDB_BASE}/search/tv`, {
-            params: { ...commonParams, query: parsed.title, ...(parsed.year ? { first_air_date_year: parsed.year } : {}) }
-        })
-    ]);
+    for (const query of queryVariants) {
+        for (const useYear of [true, false]) {
+            const [movieRes, tvRes] = await performSearch({ ...parsed, title: query }, apiKey, language, useYear);
 
-    let bestMovie = null, bestTv = null, bestMovieScore = -1, bestTvScore = -1;
+            let bestMovie = null, bestTv = null, bestMovieScore = -1, bestTvScore = -1;
 
-    if (movieRes.status === 'fulfilled') {
-        for (const r of (movieRes.value.data.results || []).slice(0, 5)) {
-            const s = scoreResult(parsed, r, false);
-            if (s > bestMovieScore) { bestMovieScore = s; bestMovie = r; }
+            if (movieRes.status === 'fulfilled') {
+                for (const r of (movieRes.value.data.results || []).slice(0, 8)) {
+                    const s = scoreResult({ ...parsed, title: query }, r, false);
+                    if (s > bestMovieScore) { bestMovieScore = s; bestMovie = r; }
+                }
+            }
+            if (tvRes.status === 'fulfilled') {
+                for (const r of (tvRes.value.data.results || []).slice(0, 8)) {
+                    const s = scoreResult({ ...parsed, title: query }, r, true);
+                    if (s > bestTvScore) { bestTvScore = s; bestTv = r; }
+                }
+            }
+
+            if (!bestMovie && !bestTv) continue;
+
+            const maxScore = Math.max(bestMovieScore, bestTvScore);
+            if (maxScore < 30) continue;
+            if (useYear && parsed.likelyTv && bestTvScore < 30) {
+                continue;
+            }
+
+            const isTV = bestTvScore > bestMovieScore;
+            if (parsed.likelyTv && !isTV) {
+                continue;
+            }
+            const winner = isTV ? bestTv : bestMovie;
+
+            return buildTmdbInfo(winner, isTV);
         }
     }
-    if (tvRes.status === 'fulfilled') {
-        for (const r of (tvRes.value.data.results || []).slice(0, 5)) {
-            const s = scoreResult(parsed, r, true);
-            if (s > bestTvScore) { bestTvScore = s; bestTv = r; }
-        }
-    }
 
-    if (!bestMovie && !bestTv) return null;
+    return null;
+}
 
-    // 分数过低则认为未匹配
-    const maxScore = Math.max(bestMovieScore, bestTvScore);
-    if (maxScore < 30) return null;
-
-    const isTV = bestTvScore > bestMovieScore;
-    const winner = isTV ? bestTv : bestMovie;
-
-    return buildTmdbInfo(winner, isTV);
+async function searchTmdb(shareTitle, apiKey, language = 'zh-CN') {
+    return searchTmdbByGuess(parseName(shareTitle), apiKey, language);
 }
 
 /**
@@ -180,9 +266,7 @@ async function searchTmdb(shareTitle, apiKey, language = 'zh-CN') {
  */
 async function getTmdbById(tmdbId, type, apiKey, language = 'zh-CN') {
     const endpoint = type === 'tv' ? `/tv/${tmdbId}` : `/movie/${tmdbId}`;
-    const res = await axios.get(`${TMDB_BASE}${endpoint}`, {
-        params: { api_key: apiKey, language }
-    });
+    const res = await tmdbGet(endpoint, { api_key: apiKey, language });
     if (!res.data || !res.data.id) {
         throw new Error('TMDB 未找到该ID');
     }
@@ -210,4 +294,10 @@ function buildTmdbInfo(data, isTV) {
     };
 }
 
-module.exports = { searchTmdb, getTmdbById, parseName };
+module.exports = {
+    searchTmdb,
+    searchTmdbByGuess,
+    getTmdbById,
+    parseName,
+    titleSimilarity
+};

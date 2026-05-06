@@ -6,7 +6,7 @@
  * - 同一条件内多个值用逗号分隔：任意满足（OR）
  * - !值 表示排除该值（NOT）
  * - 空对象 {} 表示兜底（always match）
- * - 按声明顺序匹配，第一个命中的分类获胜
+ * - 若多个分类同时命中，优先选择条件更多、更具体的规则
  */
 
 function matchConditionValue(itemValues, conditionStr) {
@@ -63,6 +63,19 @@ function matchesConditions(tmdbInfo, conditions) {
     return true;
 }
 
+function calcRuleSpecificity(conditions) {
+    if (!conditions || Object.keys(conditions).length === 0) return 0;
+
+    let score = 0;
+    for (const value of Object.values(conditions)) {
+        const values = String(value).split(',').map(v => v.trim()).filter(Boolean);
+        // 条件字段越多越具体；单字段可选值越少也越具体
+        score += 100;
+        score += Math.max(0, 10 - values.length);
+    }
+    return score;
+}
+
 /**
  * 匹配分类名称
  * @param {object} tmdbInfo 包含 isTV / genreIds / originalLanguage / originCountry / year
@@ -75,10 +88,20 @@ function matchCategory(tmdbInfo, rules) {
     const typeRules = rules[type];
     if (!typeRules) return null;
 
+    let best = null;
     for (const [name, conditions] of Object.entries(typeRules)) {
-        if (matchesConditions(tmdbInfo, conditions)) return name;
+        if (!matchesConditions(tmdbInfo, conditions)) continue;
+
+        const candidate = {
+            name,
+            specificity: calcRuleSpecificity(conditions)
+        };
+
+        if (!best || candidate.specificity > best.specificity) {
+            best = candidate;
+        }
     }
-    return null;
+    return best?.name || null;
 }
 
 module.exports = { matchCategory };

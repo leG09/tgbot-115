@@ -27,6 +27,7 @@ process.once('SIGTERM', () => bot.stop('SIGTERM'));
 bot.launch({}, () => {
     log('✅ 115转存机器人已启动');
     log(`📋 TMDB 语言: ${config.tmdb?.language || 'zh-CN'}`);
+    log(`🧠 AI 识别: ${config.ai?.enabled ? '已启用' : '未启用（使用启发式识别）'}`);
     log(`🔗 Webhook: ${config.webhook?.url ? '已配置' : '未配置'}`);
     const ids = config.telegram?.allowedChatIds;
     if (ids?.length) log(`🔒 允许的群组/用户: ${ids.join(', ')}`);

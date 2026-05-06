@@ -16,8 +16,8 @@ class Service115 {
         };
     }
 
-    _getHeaders(cookie) {
-        return { ...this.headers, "Cookie": cookie };
+    _getHeaders(cookie, host = "webapi.115.com") {
+        return { ...this.headers, "Host": host, "Cookie": cookie };
     }
 
     async getUserInfo(cookie) {
@@ -53,6 +53,32 @@ class Service115 {
                 };
             }
             throw new Error(res.data.error || "获取目录失败");
+        } catch (e) {
+            throw new Error(e.message);
+        }
+    }
+
+    async getFolderEntries(cookie, cid = "0", limit = 1000) {
+        try {
+            const res = await axios.get("https://webapi.115.com/files", {
+                headers: this._getHeaders(cookie),
+                httpsAgent: this.agent,
+                params: { aid: 1, cid, o: "user_ptime", asc: 0, offset: 0, show_dir: 1, limit, type: 0, format: "json" }
+            });
+            if (!res.data.state) {
+                throw new Error(res.data.error || "获取目录内容失败");
+            }
+            return {
+                success: true,
+                path: res.data.path || [],
+                list: (res.data.data || []).map(item => ({
+                    id: String(item.cid || item.fid),
+                    cid: item.cid ? String(item.cid) : null,
+                    fid: item.fid ? String(item.fid) : null,
+                    name: item.n || '',
+                    isFolder: Boolean(item.cid && !item.fid)
+                }))
+            };
         } catch (e) {
             throw new Error(e.message);
         }
@@ -189,6 +215,47 @@ class Service115 {
             throw new Error(res.data.error || res.data.msg || "重命名失败");
         } catch (e) {
             throw new Error("重命名失败: " + e.message);
+        }
+    }
+
+    async moveItems(cookie, ids, targetCid) {
+        const list = Array.isArray(ids) ? ids.filter(Boolean) : [ids].filter(Boolean);
+        if (list.length === 0) return { success: true, count: 0 };
+        const postData = qs.stringify({
+            ids: list.join(','),
+            to_cid: targetCid
+        });
+        try {
+            const res = await axios.post("https://proapi.115.com/android/files/move", postData, {
+                headers: this._getHeaders(cookie, "proapi.115.com"),
+                httpsAgent: this.agent
+            });
+            if (res.data?.state || res.data?.errNo === 0) {
+                return { success: true, count: list.length, data: res.data };
+            }
+            throw new Error(res.data?.error || res.data?.msg || "移动失败");
+        } catch (e) {
+            throw new Error("移动失败: " + e.message);
+        }
+    }
+
+    async deleteItems(cookie, ids) {
+        const list = Array.isArray(ids) ? ids.filter(Boolean) : [ids].filter(Boolean);
+        if (list.length === 0) return { success: true, count: 0 };
+        const postData = qs.stringify({
+            file_ids: list.join(',')
+        });
+        try {
+            const res = await axios.post("https://proapi.115.com/android/rb/delete", postData, {
+                headers: this._getHeaders(cookie, "proapi.115.com"),
+                httpsAgent: this.agent
+            });
+            if (res.data?.state || res.data?.errNo === 0) {
+                return { success: true, count: list.length, data: res.data };
+            }
+            throw new Error(res.data?.error || res.data?.msg || "删除失败");
+        } catch (e) {
+            throw new Error("删除失败: " + e.message);
         }
     }
 }
