@@ -515,19 +515,51 @@ function createBot(config) {
         throw new Error('创建临时目录失败');
     }
 
+    async function deleteItemWithRetries(itemId, attempts = 3) {
+        let lastError = null;
+        for (let attempt = 0; attempt < attempts; attempt++) {
+            try {
+                if (attempt > 0) {
+                    await sleep(1000 * attempt);
+                }
+                await service115.deleteItems(cookie, itemId);
+                return { success: true };
+            } catch (e) {
+                lastError = e;
+            }
+        }
+        return {
+            success: false,
+            error: lastError?.message || '删除失败'
+        };
+    }
+
     async function handleExistingFolder(session, existingFolder, parentCid, folderName, singleFolderShare) {
         const skipped = [];
 
         if (session.mergeMode === 'overwrite') {
-            await service115.deleteItems(cookie, existingFolder.cid);
-            const deleted = await waitForFolderAbsent(parentCid, folderName);
-            if (!deleted) {
-                throw new Error('已有目录删除超时，请稍后重试');
+            const tempExistingName = `${folderName}.__overwrite__${Date.now()}`;
+            await service115.renameFile(cookie, existingFolder.cid, tempExistingName);
+            try {
+                const imported = await saveShareIntoNewFolder(
+                    parentCid,
+                    folderName,
+                    singleFolderShare,
+                    session.shareItems,
+                    session.shareCode,
+                    session.receiveCode,
+                    session.fileIds
+                );
+                const cleanup = await deleteItemWithRetries(existingFolder.cid, 3);
+                return {
+                    ...imported,
+                    skipped,
+                    cleanupWarning: cleanup.success ? '' : `旧目录清理失败，已保留为 <code>${escapeHtml(tempExistingName)}</code>：${escapeHtml(cleanup.error)}`
+                };
+            } catch (e) {
+                await service115.renameFile(cookie, existingFolder.cid, folderName).catch(() => {});
+                throw e;
             }
-            return {
-                ...await saveShareIntoNewFolder(parentCid, folderName, singleFolderShare, session.shareItems, session.shareCode, session.receiveCode, session.fileIds),
-                skipped
-            };
         }
 
         if (session.mergeMode === 'rename') {
@@ -661,6 +693,7 @@ function createBot(config) {
         let skipped = [];
         let noNewContent = false;
         let noNewContentMessage = '';
+        let cleanupWarning = '';
         try {
             const conflict = await ensureConflictStrategy(session, parentCid, parentDisplayPath, folderName);
             if (conflict.shouldPause) {
@@ -688,6 +721,7 @@ function createBot(config) {
                 skipped = result.skipped || [];
                 noNewContent = Boolean(result.noNewContent);
                 noNewContentMessage = result.message || '';
+                cleanupWarning = result.cleanupWarning || '';
             } else {
                 const result = await saveShareIntoNewFolder(parentCid, folderName, singleFolderShare, shareItems, shareCode, receiveCode, fileIds);
                 if (result.alreadySaved) {
@@ -729,6 +763,7 @@ function createBot(config) {
             `📊 文件数量: ${saveCount}`,
             noNewContentMessage ? `ℹ️ ${escapeHtml(noNewContentMessage)}` : '',
             skipped.length ? `⏭️ 跳过重名项: ${skipped.length}` : '',
+            cleanupWarning ? `⚠️ ${cleanupWarning}` : '',
             tmdbInfo.verified === false ? `⚠️ 当前结果为 AI 识别，TMDB 未验证` : '',
             webhookNote,
         ].join('\n'));

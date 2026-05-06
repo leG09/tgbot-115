@@ -202,12 +202,14 @@ class Service115 {
     async renameFile(cookie, fileId, fileName) {
         const postData = qs.stringify({
             fid: fileId,
-            file_name: fileName
+            file_name: fileName,
+            [`files_new_name[${fileId}]`]: fileName
         });
         try {
-            const res = await axios.post("https://webapi.115.com/files/edit", postData, {
+            const res = await axios.post("https://webapi.115.com/files/batch_rename", postData, {
                 headers: this._getHeaders(cookie),
-                httpsAgent: this.agent
+                httpsAgent: this.agent,
+                timeout: 10000
             });
             if (res.data.state) {
                 return { success: true };
@@ -221,14 +223,16 @@ class Service115 {
     async moveItems(cookie, ids, targetCid) {
         const list = Array.isArray(ids) ? ids.filter(Boolean) : [ids].filter(Boolean);
         if (list.length === 0) return { success: true, count: 0 };
-        const postData = qs.stringify({
-            ids: list.join(','),
-            to_cid: targetCid
+        const form = { pid: targetCid };
+        list.forEach((id, index) => {
+            form[`fid[${index}]`] = id;
         });
+        const postData = qs.stringify(form);
         try {
-            const res = await axios.post("https://proapi.115.com/android/files/move", postData, {
-                headers: this._getHeaders(cookie, "proapi.115.com"),
-                httpsAgent: this.agent
+            const res = await axios.post("https://webapi.115.com/files/move", postData, {
+                headers: this._getHeaders(cookie),
+                httpsAgent: this.agent,
+                timeout: 10000
             });
             if (res.data?.state || res.data?.errNo === 0) {
                 return { success: true, count: list.length, data: res.data };
@@ -242,13 +246,16 @@ class Service115 {
     async deleteItems(cookie, ids) {
         const list = Array.isArray(ids) ? ids.filter(Boolean) : [ids].filter(Boolean);
         if (list.length === 0) return { success: true, count: 0 };
-        const postData = qs.stringify({
-            file_ids: list.join(',')
+        const form = {};
+        list.forEach((id, index) => {
+            form[`fid[${index}]`] = id;
         });
+        const postData = qs.stringify(form);
         try {
-            const res = await axios.post("https://proapi.115.com/android/rb/delete", postData, {
-                headers: this._getHeaders(cookie, "proapi.115.com"),
-                httpsAgent: this.agent
+            const res = await axios.post("https://webapi.115.com/rb/delete", postData, {
+                headers: this._getHeaders(cookie),
+                httpsAgent: this.agent,
+                timeout: 10000
             });
             if (res.data?.state || res.data?.errNo === 0) {
                 return { success: true, count: list.length, data: res.data };
