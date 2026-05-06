@@ -91,6 +91,49 @@ function createBot(config) {
         return new Promise(resolve => setTimeout(resolve, ms));
     }
 
+    function isoNow() {
+        return new Date().toISOString();
+    }
+
+    function perfNow() {
+        return Date.now();
+    }
+
+    function buildLogContext(session, extra = {}) {
+        return {
+            ts: isoNow(),
+            userId: session?.userId,
+            chatId: session?.chatId,
+            shareCode: session?.shareCode,
+            mergeMode: session?.mergeMode || null,
+            ...extra
+        };
+    }
+
+    function logStep(tag, session, extra = {}) {
+        console.log(tag, JSON.stringify(buildLogContext(session, extra)));
+    }
+
+    async function timed(tag, session, extra, fn) {
+        const start = perfNow();
+        logStep(`${tag}:start`, session, extra);
+        try {
+            const result = await fn();
+            logStep(`${tag}:done`, session, {
+                ...extra,
+                durationMs: perfNow() - start
+            });
+            return result;
+        } catch (e) {
+            logStep(`${tag}:error`, session, {
+                ...extra,
+                durationMs: perfNow() - start,
+                error: e.message
+            });
+            throw e;
+        }
+    }
+
     async function throttleMergeOp() {
         const ms = MERGE_THROTTLE_MIN_MS + Math.floor(Math.random() * (MERGE_THROTTLE_MAX_MS - MERGE_THROTTLE_MIN_MS + 1));
         await sleep(ms);
@@ -98,10 +141,13 @@ function createBot(config) {
 
     async function waitForSavedFolder(parentCid, beforeCids, expectedNames) {
         const uniqueNames = [...new Set(expectedNames.filter(Boolean))];
+        const startedAt = perfNow();
         for (let attempt = 0; attempt < 8; attempt++) {
             const { list } = await service115.getAllFolders(cookie, parentCid, 1000);
             console.log('[save] waitForSavedFolder', JSON.stringify({
+                ts: isoNow(),
                 attempt: attempt + 1,
+                elapsedMs: perfNow() - startedAt,
                 parentCid,
                 folderCount: list.length,
                 expectedNames: uniqueNames
@@ -130,9 +176,17 @@ function createBot(config) {
     }
 
     async function waitForFolderAbsent(parentCid, folderName) {
+        const startedAt = perfNow();
         for (let attempt = 0; attempt < 10; attempt++) {
             const existing = await findFolderByName(parentCid, folderName);
             if (!existing) return true;
+            console.log('[save] waitForFolderAbsent', JSON.stringify({
+                ts: isoNow(),
+                attempt: attempt + 1,
+                elapsedMs: perfNow() - startedAt,
+                parentCid,
+                folderName
+            }));
             await sleep(1000);
         }
         return false;
@@ -367,7 +421,9 @@ function createBot(config) {
             `🧠 正在识别影视信息...\n<code>${escapeHtml(session.shareTitle)}</code>`);
 
         try {
-            const recognition = await recognizeMedia(session.shareTitle, config);
+            const recognition = await timed('[perf] recognizeMedia', session, {
+                shareTitle: session.shareTitle
+            }, () => recognizeMedia(session.shareTitle, config));
             const tmdbInfo = recognition.finalInfo;
             session.tmdbInfo = tmdbInfo;
             session.aiRecognition = recognition.aiResult;
@@ -389,10 +445,20 @@ function createBot(config) {
     // 执行转存 + Webhook
     // ──────────────────────────────────────────
     async function mergeFolderContents(sourceFolderCid, targetFolderCid, skipped, pathPrefix = '') {
+        const startedAt = perfNow();
         const [sourceRes, targetRes] = await Promise.all([
             service115.getFolderEntries(cookie, sourceFolderCid),
             service115.getFolderEntries(cookie, targetFolderCid)
         ]);
+        console.log('[perf] mergeFolderContents:scan', JSON.stringify({
+            ts: isoNow(),
+            sourceFolderCid,
+            targetFolderCid,
+            pathPrefix,
+            durationMs: perfNow() - startedAt,
+            sourceCount: sourceRes.list.length,
+            targetCount: targetRes.list.length
+        }));
         const targetByName = new Map(targetRes.list.map(item => [item.name, item]));
 
         for (const sourceItem of sourceRes.list) {
@@ -428,10 +494,19 @@ function createBot(config) {
         let saveCount = 0;
 
         if (singleFolderShare) {
-            const foldersBeforeSave = await service115.getAllFolders(cookie, parentCid, 1000);
+            const foldersBeforeSave = await timed('[perf] getAllFolders:beforeSave', null, {
+                parentCid,
+                folderName,
+                singleFolderShare
+            }, () => service115.getAllFolders(cookie, parentCid, 1000));
             const beforeCids = new Set(foldersBeforeSave.list.map(folder => String(folder.cid)));
             const sourceFolderName = shareItems[0].name || folderName;
-            const saveResult = await service115.saveFiles(cookie, parentCid, shareCode, receiveCode, fileIds);
+            const saveResult = await timed('[perf] saveFiles', null, {
+                parentCid,
+                folderName,
+                fileCount: fileIds.length,
+                singleFolderShare
+            }, () => service115.saveFiles(cookie, parentCid, shareCode, receiveCode, fileIds));
             if (!saveResult.success) {
                 if (isAlreadySavedMessage(saveResult.msg)) {
                     return {
@@ -446,13 +521,21 @@ function createBot(config) {
             }
             saveCount = saveResult.count;
 
-            const savedFolder = await waitForSavedFolder(parentCid, beforeCids, [sourceFolderName, folderName]);
+            const savedFolder = await timed('[perf] waitForSavedFolder', null, {
+                parentCid,
+                folderName,
+                expectedNames: [sourceFolderName, folderName]
+            }, () => waitForSavedFolder(parentCid, beforeCids, [sourceFolderName, folderName]));
             if (!savedFolder) {
                 throw new Error('转存已完成，但无法定位新目录');
             }
 
             if (savedFolder.name !== folderName) {
-                await service115.renameFile(cookie, savedFolder.cid, folderName);
+                await timed('[perf] renameFile', null, {
+                    fileId: savedFolder.cid,
+                    from: savedFolder.name,
+                    to: folderName
+                }, () => service115.renameFile(cookie, savedFolder.cid, folderName));
             }
 
             return {
@@ -462,8 +545,16 @@ function createBot(config) {
             };
         }
 
-        const tempFolder = await service115.addFolder(cookie, parentCid, folderName);
-        const saveResult = await service115.saveFiles(cookie, tempFolder.cid, shareCode, receiveCode, fileIds);
+        const tempFolder = await timed('[perf] addFolder', null, {
+            parentCid,
+            folderName
+        }, () => service115.addFolder(cookie, parentCid, folderName));
+        const saveResult = await timed('[perf] saveFiles', null, {
+            parentCid: tempFolder.cid,
+            folderName,
+            fileCount: fileIds.length,
+            singleFolderShare
+        }, () => service115.saveFiles(cookie, tempFolder.cid, shareCode, receiveCode, fileIds));
         if (!saveResult.success) {
             if (isAlreadySavedMessage(saveResult.msg)) {
                 await service115.deleteItems(cookie, tempFolder.cid).catch(() => {});
@@ -522,9 +613,22 @@ function createBot(config) {
                 if (attempt > 0) {
                     await sleep(1000 * attempt);
                 }
+                const startedAt = perfNow();
                 await service115.deleteItems(cookie, itemId);
+                console.log('[perf] deleteItems:done', JSON.stringify({
+                    ts: isoNow(),
+                    itemId,
+                    attempt: attempt + 1,
+                    durationMs: perfNow() - startedAt
+                }));
                 return { success: true };
             } catch (e) {
+                console.log('[perf] deleteItems:error', JSON.stringify({
+                    ts: isoNow(),
+                    itemId,
+                    attempt: attempt + 1,
+                    error: e.message
+                }));
                 lastError = e;
             }
         }
@@ -659,6 +763,7 @@ function createBot(config) {
         const folderName = buildFolderName(tmdbInfo);
         const singleFolderShare = isSingleFolderShare(shareItems);
         console.log('[save] start', JSON.stringify({
+            ts: isoNow(),
             shareCode,
             receiveCode: receiveCode ? '***' : '',
             fileIds,
@@ -675,7 +780,7 @@ function createBot(config) {
 
         let parentCid, parentDisplayPath;
         try {
-            ({ parentCid, parentDisplayPath } = await resolveTargetParent(session));
+            ({ parentCid, parentDisplayPath } = await timed('[perf] resolveTargetParent', session, {}, () => resolveTargetParent(session)));
         } catch (e) {
             session.saveInProgress = false;
             await safeEdit(session.chatId, session.botMessageId,
@@ -695,7 +800,11 @@ function createBot(config) {
         let noNewContentMessage = '';
         let cleanupWarning = '';
         try {
-            const conflict = await ensureConflictStrategy(session, parentCid, parentDisplayPath, folderName);
+            const conflict = await timed('[perf] ensureConflictStrategy', session, {
+                parentCid,
+                parentDisplayPath,
+                folderName
+            }, () => ensureConflictStrategy(session, parentCid, parentDisplayPath, folderName));
             if (conflict.shouldPause) {
                 session.saveInProgress = false;
                 sessions.set(session.userId, session);
@@ -750,7 +859,10 @@ function createBot(config) {
         let webhookNote = '';
         if (config.webhook?.url) {
             try {
-                const webhookResp = await callWebhook(finalFolderName, parentDisplayPath);
+                const webhookResp = await timed('[perf] webhook', session, {
+                    folderName: finalFolderName,
+                    parentDisplayPath
+                }, () => callWebhook(finalFolderName, parentDisplayPath));
                 webhookNote = `\n🔄 Webhook: <code>${escapeHtml(webhookResp)}</code>`;
             } catch (e) {
                 webhookNote = `\n⚠️ Webhook 调用失败: <code>${escapeHtml(e.message)}</code>`;
@@ -803,7 +915,9 @@ function createBot(config) {
     // ──────────────────────────────────────────
     async function loadShareInfo(session, shareCode, receiveCode) {
         try {
-            const info = await service115.getShareInfo(cookie, shareCode, receiveCode);
+            const info = await timed('[perf] getShareInfo', session, {
+                shareCode
+            }, () => service115.getShareInfo(cookie, shareCode, receiveCode));
             session.fileIds = info.fileIds;
             session.shareItems = info.items;
             session.shareTitle = info.shareTitle;
