@@ -38,6 +38,56 @@ function isError(error, name) {
     return message.includes(name);
 }
 
+function parseFloodSeconds(error) {
+    const fields = [
+        error?.seconds,
+        error?.errorMessage,
+        error?.message,
+        String(error || '')
+    ];
+    for (const field of fields) {
+        if (typeof field === 'number' && Number.isFinite(field)) {
+            return field;
+        }
+        const match = String(field || '').match(/FLOOD_WAIT_?(\d+)|wait of (\d+) seconds/i);
+        if (match) {
+            return Number(match[1] || match[2]);
+        }
+    }
+    return null;
+}
+
+function formatSeconds(seconds) {
+    if (!Number.isFinite(seconds)) return '';
+    const minutes = Math.floor(seconds / 60);
+    const rest = seconds % 60;
+    if (minutes <= 0) return `${seconds} 秒`;
+    return `${minutes} 分 ${rest} 秒`;
+}
+
+function describeTelegramError(error) {
+    const fields = {
+        name: error?.name,
+        className: error?.className,
+        code: error?.code,
+        errorMessage: error?.errorMessage,
+        message: error?.message,
+        seconds: error?.seconds
+    };
+    const details = Object.entries(fields)
+        .filter(([, value]) => value !== undefined && value !== null && value !== '')
+        .map(([key, value]) => `${key}: ${value}`);
+    if (!details.length) {
+        details.push(`raw: ${String(error)}`);
+    }
+
+    const floodSeconds = parseFloodSeconds(error);
+    if (floodSeconds !== null) {
+        details.push(`floodWait: ${formatSeconds(floodSeconds)} (${floodSeconds} 秒)`);
+    }
+    return details.join('\n');
+}
+
 function printLoginHint() {
     console.log('Telegram 用户账号登录');
     console.log('验证码只会提交一次；如果输错，脚本会退出，不会自动重试。');
@@ -119,7 +169,8 @@ async function main() {
 
 main().catch(error => {
     console.error('');
-    console.error(`登录失败: ${error?.errorMessage || error?.message || error}`);
+    console.error('登录失败，Telegram 返回：');
+    console.error(describeTelegramError(error));
     console.error('脚本已停止，没有继续重试验证码。');
     process.exit(1);
 });
