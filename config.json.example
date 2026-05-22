@@ -20,6 +20,34 @@
     "url": "http://your-yiyi-host/api/webhook/YOUR_WEBHOOK_TOKEN?providerCode=gdrive-1",
     "replacePath": "/gd*/"
   },
+  "yiyi": {
+    "baseURL": "http://127.0.0.1:18081",
+    "token": "YiYi.service-token 或管理员 Token",
+    "timeoutMs": 8000
+  },
+  "telegramUser": {
+    "enabled": false,
+    "apiId": 123456,
+    "apiHash": "YOUR_TELEGRAM_API_HASH",
+    "session": "",
+    "progressFile": "./tg_channel_progress.json",
+    "notifyChatId": "",
+    "notifySkipped": true,
+    "channels": [
+      {
+        "id": -1003785085708,
+        "name": "频道1-404频道",
+        "intervalSeconds": 10,
+        "startTime": "2026-05-05T01:00:00+08:00"
+      },
+      {
+        "id": -1002769844611,
+        "name": "爱影频道",
+        "intervalSeconds": 3,
+        "ignoreStartTime": true
+      }
+    ]
+  },
   "rootCid": "YOUR_115_ROOT_FOLDER_CID",
   "categoryRules": {
     "movie": {

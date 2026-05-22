@@ -1,6 +1,7 @@
 const fs = require('fs');
 const path = require('path');
 const { createBot } = require('./src/bot');
+const { startChannelCrawler } = require('./src/channelCrawler');
 
 const log = s => process.stderr.write(s + '\n');
 
@@ -17,9 +18,17 @@ if (!config.telegram?.token) { log('❌ 缺少 telegram.token'); process.exit(1)
 if (!config.cookie115) { log('❌ 缺少 cookie115'); process.exit(1); }
 
 const bot = createBot(config);
+let channelCrawler = null;
 
-process.once('SIGINT', () => bot.stop('SIGINT'));
-process.once('SIGTERM', () => bot.stop('SIGTERM'));
+async function shutdown(signal) {
+    if (channelCrawler?.stop) {
+        await channelCrawler.stop().catch(() => {});
+    }
+    bot.stop(signal);
+}
+
+process.once('SIGINT', () => shutdown('SIGINT'));
+process.once('SIGTERM', () => shutdown('SIGTERM'));
 
 // bot.launch() 的第二个参数是 onLaunch 回调，在 getMe() 成功后、
 // polling 循环开始前触发 —— 这是打印启动信息的正确位置
@@ -29,9 +38,16 @@ bot.launch({}, () => {
     log(`📋 TMDB 语言: ${config.tmdb?.language || 'zh-CN'}`);
     log(`🧠 AI 识别: ${config.ai?.enabled ? '已启用' : '未启用（使用启发式识别）'}`);
     log(`🔗 Webhook: ${config.webhook?.url ? '已配置' : '未配置'}`);
+    log(`📣 TG账号频道爬取: ${config.telegramUser?.enabled ? '已启用' : '未启用'}`);
     const ids = config.telegram?.allowedChatIds;
     if (ids?.length) log(`🔒 允许的群组/用户: ${ids.join(', ')}`);
     else log('⚠️  未限制来源，所有聊天均可使用');
+    startChannelCrawler(config, bot)
+        .then(crawler => {
+            channelCrawler = crawler;
+            if (crawler) log('✅ TG账号频道爬取已启动');
+        })
+        .catch(e => log('❌ TG账号频道爬取启动失败: ' + e.message));
 }).catch(e => {
     log('❌ 启动失败: ' + e.message + '\n' + (e.stack || ''));
     process.exit(1);
